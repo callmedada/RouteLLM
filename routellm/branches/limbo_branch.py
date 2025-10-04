@@ -8,6 +8,11 @@ from limbo_cluster import LimboAgglomerative
 
 from ..encoders import CategoricalFeatureVectorizer
 from ..mapping import ClusterModelMapper
+try:
+    from tqdm.auto import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    def tqdm(x, **kwargs):  # type: ignore
+        return x
 
 
 @dataclass
@@ -19,10 +24,7 @@ class BranchResult:
 
 class LimboBranch:
     """
-    LIMBO 分支：
-    - 使用外部 LimboAgglomerative 对原始离散特征字典聚类
-    - 使用 CategoricalFeatureVectorizer 生成稠密 one-hot 表征用于融合
-    - 使用 ClusterModelMapper 完成簇到模型的映射
+    LIMBO
     """
 
     def __init__(self, model_names: List[str], model_costs: List[float], num_clusters: int, beta: float, objective: str = "utility", quality_threshold: float = 0.0) -> None:
@@ -48,23 +50,21 @@ class LimboBranch:
         return (x - min_v) / denom
 
     def fit(self, features: List[Dict[str, str]], quality: np.ndarray) -> BranchResult:
-        # 聚类（基于原始字典）
+        # 聚类
         self.clusterer.fit(features)
         labels = list(self.clusterer.labels_)
 
-        # 特征表征用于融合
+        # 征表征用于融合特
         self.vectorizer.fit(features)
         X = self._normalize(self.vectorizer.transform(features))
-
-        # 簇-模型映射
         if self.objective == "min_cost":
             self.mapper.fit_min_cost(labels, quality, self.quality_threshold)
         else:
             self.mapper.fit(labels, quality, self.beta)
 
-        # 成本感知软标签：若 objective=min_cost，阈值内按 1/cost 归一
+        #  1/cost normalize
         y = np.zeros((len(labels), len(self.model_names)), dtype=np.float32)
-        for i, c in enumerate(labels):
+        for i, c in enumerate(tqdm(labels, desc="LIMBO branch labels", leave=False)):
             if self.objective == "min_cost":
                 q = quality[i]
                 ok = q >= self.quality_threshold
@@ -74,7 +74,7 @@ class LimboBranch:
                     if s > 0:
                         y[i] = inv_cost / s
                         continue
-            # 回退为映射 one-hot
+            # back tp one-hot
             name = self.mapper.mapping[c]
             y[i, self.model_names.index(name)] = 1.0
 

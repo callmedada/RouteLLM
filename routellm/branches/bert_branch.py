@@ -6,6 +6,11 @@ from typing import List
 import numpy as np
 
 from ..encoders import build_text_encoder
+try:
+    from tqdm.auto import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    def tqdm(x, **kwargs):  # type: ignore
+        return x
 from ..mapping import ClusterModelMapper
 from limbo_cluster import LimboAgglomerative
 
@@ -41,9 +46,10 @@ class BertBranch:
         return (x - min_v) / denom
 
     def fit(self, texts: List[str], quality: np.ndarray) -> BranchResult:
-        X = self.encoder.encode(texts)
+        # 大批量时让底层 encoder 显示进度，小批量不显示，避免条目不连贯
+        X = self.encoder.encode(texts, show_progress_bar=len(texts) >= 32)
         dicts = []
-        for vec in X:
+        for vec in tqdm(X, desc="BERT branch normalize", leave=False):
             v = np.asarray(vec, dtype=np.float32)
             v = v - v.min()  # 移动到非负
             s = float(v.sum())

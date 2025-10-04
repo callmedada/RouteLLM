@@ -7,6 +7,7 @@ import numpy as np
 from .pipeline import RouterPipeline, TrainConfig
 from .data import TrainItem, split_dataset, extract_xy, load_routerbench_default, parse_routerbench
 from .logger import RunLogger
+from .report import generate_evaluation_report
 
 
 def train_and_eval(
@@ -30,6 +31,24 @@ def train_and_eval(
     logger = RunLogger()
     run = logger.create()
     logger.log_metrics(run, metrics)
+    # 生成详细评估报告（若存在标签）
+    # 允许部分样本无标签：直接使用 val_items 的 label 列表（含 None）
+    try:
+        vl_labels_full = [it.label for it in val_items]
+        generate_evaluation_report(
+            pipeline,
+            vl_texts,
+            vl_feats,
+            vl_labels_full,
+            model_names,
+            model_costs,
+            save_dir=str(run.run_dir),
+            enable_calibration=config.enable_calibration,
+            fallback_strategy=config.fallback_strategy,
+            fallback_model_name=config.fallback_model_name,
+        )
+    except Exception:
+        pass
     return metrics
 
 

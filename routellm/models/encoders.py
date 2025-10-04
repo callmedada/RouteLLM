@@ -10,7 +10,7 @@ class BaseTextEncoder:
     def __init__(self, embedding_dim: int = 384) -> None:
         self.embedding_dim: int = embedding_dim
 
-    def encode(self, texts: List[str]) -> np.ndarray:
+    def encode(self, texts: List[str], show_progress_bar: Optional[bool] = None) -> np.ndarray:
         raise NotImplementedError
 
 
@@ -34,7 +34,7 @@ class HashFallbackEncoder(BaseTextEncoder):
             vector = vector / norm
         return vector
 
-    def encode(self, texts: List[str]) -> np.ndarray:
+    def encode(self, texts: List[str], show_progress_bar: Optional[bool] = None) -> np.ndarray:
         return np.vstack([self._encode_one(t) for t in texts])
 
 
@@ -48,8 +48,14 @@ class SentenceTransformerEncoder(BaseTextEncoder):
         self._model = SentenceTransformer(model_name)
         self.embedding_dim = getattr(self._model, "get_sentence_embedding_dimension", lambda: embedding_dim)()
 
-    def encode(self, texts: List[str]) -> np.ndarray:
-        embeddings = self._model.encode(texts, normalize_embeddings=True)
+    def encode(self, texts: List[str], show_progress_bar: Optional[bool] = None) -> np.ndarray:
+        # 仅在批量较大时显示内部进度条，避免小批量刷屏
+        if show_progress_bar is None:
+            try:
+                show_progress_bar = len(texts) >= 32
+            except Exception:
+                show_progress_bar = False
+        embeddings = self._model.encode(texts, normalize_embeddings=True, show_progress_bar=bool(show_progress_bar))
         return np.asarray(embeddings, dtype=np.float32)
 
 

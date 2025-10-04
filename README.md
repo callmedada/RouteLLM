@@ -1,13 +1,24 @@
-# RouteLLM 
+# RouteLLM (OOP Pipeline)
 
-cheap LLM but good performance (hopefully)
-
+A modular LLM router that sends each query to the cheapest model that meets a quality threshold. The pipeline fuses two branches: LIMBO (feature-based) and BERT (dense embedding), then learns a small PyTorch fuser (MLP or Attention) with cost‑aware soft labels.
 
 ## Install
 ```bash
 pip install -U numpy torch fastapi uvicorn pandas sentence-transformers  # optional
 pip install limbo-cluster  # LIMBO package
+
 ```
+
+```bash
+
+#  uv 安装
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv .venv
+source .venv/bin/activate
+uv pip install -e '.[dev,sentence,uvicorn,limbo]'
+uv run pytest -q
+```
+
 
 ## Dataset
 - Default dataset: `routerbench_0shot.pkl` (pandas DataFrame). Loader parses model columns and per‑model total costs automatically.

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "routellm"
+version = "0.1.0"
+description = "A modular LLM router with LIMBO + BERT fusion and cost-aware training."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "ChengDa Zheng" }]
+keywords = ["LLM", "routing", "NLP", "fastapi", "pytorch"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "torch>=2.0; platform_system != 'Darwin' or platform_machine != 'arm64'",
+  "fastapi>=0.110",
+  "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+sentence = ["sentence-transformers>=2.2"]
+uvicorn = ["uvicorn>=0.23"]
+limbo = ["limbo-cluster>=0.1"]
+dev = [
+  "pytest>=7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/callmedada/RouteLLM"
+
+[tool.setuptools]
+packages = { find = { where = ["."], include = ["routellm*"], exclude = ["tests*"] } }
+
+[project.scripts]
+routellm-grid = "cli:main"
+
+

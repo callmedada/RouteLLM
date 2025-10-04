@@ -5,6 +5,12 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    # 优先使用 tqdm 作为训练进度条；若不可用则优雅降级为无进度条
+    from tqdm.auto import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    def tqdm(x, **kwargs):  # type: ignore
+        return x
 
 
 class MLPFuserTorch(nn.Module):
@@ -22,11 +28,14 @@ class MLPFuserTorch(nn.Module):
         return F.log_softmax(x, dim=-1)
 
 
-def train_fuser(model: MLPFuserTorch, x: torch.Tensor, y_soft: torch.Tensor, epochs: int = 200, lr: float = 1e-2, batch_size: int = 64) -> None:
+def train_fuser(model: MLPFuserTorch, x: torch.Tensor, y_soft: torch.Tensor, epochs: int = 200, lr: float = 1e-2, batch_size: int = 64, use_tqdm: bool = True) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     n = x.size(0)
-    for _ in range(epochs):
+    epoch_iter = tqdm(range(epochs), desc="Fuser training", leave=False) if use_tqdm else range(epochs)
+    for _ in epoch_iter:
         perm = torch.randperm(n)
+        running_loss = 0.0
+        num_batches = 0
         for i in range(0, n, batch_size):
             idx = perm[i : i + batch_size]
             xb = x[idx]
@@ -36,6 +45,14 @@ def train_fuser(model: MLPFuserTorch, x: torch.Tensor, y_soft: torch.Tensor, epo
             loss = F.kl_div(logp, yb, reduction="batchmean")
             loss.backward()
             optimizer.step()
+            running_loss += float(loss.detach().cpu())
+            num_batches += 1
+        if use_tqdm:
+            avg_loss = running_loss / max(1, num_batches)
+            try:
+                epoch_iter.set_postfix({"loss": f"{avg_loss:.4f}"})
+            except Exception:
+                pass
 
 
 class AttentionFuserTorch(nn.Module):
