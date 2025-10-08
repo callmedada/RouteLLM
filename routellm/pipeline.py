@@ -21,8 +21,12 @@ except Exception:  # pragma: no cover
 
 
 @dataclass
+# 也许我们可以把所有tunable的hyperparameter都写在这边？
+# 目前有你的那三个可以控制weighting of cost and performance
+# 现在加了beta
+# 还差LIMBO的tau。然后再做grid search？
 class TrainConfig(TrainConfig):
-    pass
+    beta: float = 0.5 # alpha controls the weighting. 1 means all LIMBO, 0 means all BERT.
 
 
 class RouterPipeline:
@@ -130,12 +134,21 @@ class RouterPipeline:
     def predict(self, query_text: str, query_features: Dict[str, str]) -> Tuple[str, float, int]:
         if self.fuser_torch is None:
             raise RuntimeError("Pipeline not fitted")
+        
+        # fetching beta
+        beta = float(getattr(self.config, "beta", 0.5))
+        if beta < 0 or beta > 1:
+            raise RuntimeError("Beta must be in the range of [0, 1].")
 
         # fusion here
         x_limbo = self.limbo_branch.vectorizer.transform([query_features])
         # 单条预测禁用编码器内部进度，避免不连贯
         x_bert = self.bert_branch.encoder.encode([query_text], show_progress_bar=False)
-        x = np.hstack([self._normalize(x_limbo), self._normalize(x_bert)])
+        # fusing two branches with beta
+        x = np.hstack([
+            self._normalize(x_limbo) * beta, 
+            self._normalize(x_bert) * (1 - beta),
+        ])
 
         import torch
 
