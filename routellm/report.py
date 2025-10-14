@@ -154,6 +154,7 @@ def generate_evaluation_report(
     enable_calibration: bool = True,
     fallback_strategy: str = "best_fixed",
     fallback_model_name: Optional[str] = None,
+    per_sample_costs: Optional[List[List[float]]] = None,
 ) -> Dict[str, object]:
     os.makedirs(save_dir, exist_ok=True)
 
@@ -161,8 +162,18 @@ def generate_evaluation_report(
 
     # 批量前向，取出 log 概率、概率、预测与置信度
     x_limbo = pipeline.limbo_branch.vectorizer.transform(features)
-    x_bert = pipeline.bert_branch.encoder.encode(texts, show_progress_bar=False)
-    xn = np.hstack([pipeline._normalize(x_limbo), pipeline._normalize(x_bert)])
+    x_bert = pipeline.bert_branch.transform_texts(texts, show_progress_bar=False)
+    xn = np.hstack([x_limbo, x_bert])
+    # 门控缩放与 pipeline 保持一致
+    fusion_beta = float(getattr(pipeline.config, "fusion_beta", pipeline.config.lambda_soft))
+    fusion_beta = max(0.0, min(1.0, fusion_beta))
+    limbo_dim = x_limbo.shape[1]
+    bert_dim = x_bert.shape[1]
+    if xn.size > 0 and (limbo_dim + bert_dim) == xn.shape[1]:
+        xn = xn.copy()
+        xn[:, :limbo_dim] *= fusion_beta
+        xn[:, limbo_dim:] *= (1.0 - fusion_beta)
+    xn = pipeline._normalize(xn)
     probs: List[np.ndarray] = []
     logps: List[np.ndarray] = []
     preds: List[int] = []
@@ -189,7 +200,11 @@ def generate_evaluation_report(
 
     # overall cost & acc
     costs_arr = np.asarray(model_costs, dtype=np.float32)
-    avg_cost = float(costs_arr[preds_np].mean()) if len(preds_np) else 0.0
+    if per_sample_costs is not None and len(per_sample_costs) == len(texts):
+        costs_mat = np.asarray(per_sample_costs, dtype=np.float32)
+        avg_cost = float(costs_mat[np.arange(costs_mat.shape[0])[mask], preds_np].mean()) if mask.any() else float(costs_mat[np.arange(costs_mat.shape[0]), preds_np].mean())
+    else:
+        avg_cost = float(costs_arr[preds_np].mean()) if len(preds_np) else 0.0
     top1_acc = float((preds_np == labels_np).mean()) if len(labels_np) else 0.0
     cost_per_correct = avg_cost / max(1e-12, top1_acc)
 
@@ -213,7 +228,10 @@ def generate_evaluation_report(
     best_fixed_acc = -1.0
     for i, name in enumerate(model_names):
         acc_i = float((labels_np == i).mean())
-        cost_i = float(costs_arr[i])
+        if per_sample_costs is not None and len(per_sample_costs) == len(texts):
+            cost_i = float(np.asarray(per_sample_costs, dtype=np.float32)[:, i].mean())
+        else:
+            cost_i = float(costs_arr[i])
         fixed_baselines[name] = {"acc": acc_i, "cost": cost_i}
         if acc_i > best_fixed_acc:
             best_fixed_acc = acc_i
@@ -224,8 +242,10 @@ def generate_evaluation_report(
     oracle_costs: List[float] = []
     for i in range(len(labels_np)):
         y = labels_np[i]
-        # 该样本所有正确模型里取成本最低
-        oracle_costs.append(float(costs_arr[y]))
+        if per_sample_costs is not None and len(per_sample_costs) == len(texts):
+            oracle_costs.append(float(np.asarray(per_sample_costs, dtype=np.float32)[i, y]))
+        else:
+            oracle_costs.append(float(costs_arr[y]))
     oracle_lower_cost = float(np.mean(oracle_costs)) if oracle_costs else 0.0
 
     # cost-performance frontier with fallback
@@ -242,7 +262,11 @@ def generate_evaluation_report(
         use_pred = (probs_T.max(axis=1) >= tau)
         chosen = np.where(use_pred, preds_np, fallback_idx)
         acc_tau = float((chosen == labels_np).mean())
-        cost_tau = float(costs_arr[chosen].mean())
+        if per_sample_costs is not None and len(per_sample_costs) == len(texts):
+            costs_mat = np.asarray(per_sample_costs, dtype=np.float32)
+            cost_tau = float(costs_mat[np.arange(costs_mat.shape[0])[mask], chosen[mask]].mean()) if mask.any() else float(costs_mat[np.arange(costs_mat.shape[0]), chosen].mean())
+        else:
+            cost_tau = float(costs_arr[chosen].mean())
         frontier.append((float(tau), acc_tau, cost_tau))
 
     # find min-cost point with acc >= current acc
@@ -319,6 +343,17 @@ def generate_evaluation_report(
         f.write(f"- avg_cost: {avg_cost}\n")
         f.write(f"- top1_acc: {top1_acc}\n")
         f.write(f"- cost_per_correct: {cost_per_correct}\n\n")
+        # 记录关键超参数（含融合与LIMBO）
+        cfg = getattr(pipeline, "config", None)
+        if cfg is not None:
+            fusion_beta_md = getattr(cfg, "fusion_beta", getattr(cfg, "lambda_soft", None))
+            limbo_tau_md = getattr(cfg, "limbo_tau", None)
+            utility_beta_md = getattr(cfg, "utility_beta", getattr(cfg, "beta", None))
+            f.write("## Hyperparameters\n\n")
+            f.write(f"- fusion_beta: {fusion_beta_md}\n")
+            f.write(f"- limbo_tau: {limbo_tau_md}\n")
+            f.write(f"- utility_beta: {utility_beta_md}\n")
+            f.write(f"- frontier_best_tau: {best_tau}\n\n")
         f.write("## Route Ratios\n\n")
         for k, v in route_hist.items():
             f.write(f"- {k}: {v}\n")

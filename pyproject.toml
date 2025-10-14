@@ -29,7 +29,7 @@ dependencies = [
 [project.optional-dependencies]
 sentence = ["sentence-transformers>=2.2"]
 uvicorn = ["uvicorn>=0.23"]
-limbo = ["limbo-cluster>=0.1"]
+limbo = ["limbo-cluster @ git+https://github.com/callmedada/LIMBO.git"]
 dev = [
   "pytest>=7.0",
 ]

@@ -14,6 +14,7 @@ class TrainItem(BaseModel):
     features: Dict[str, str] = Field(default_factory=dict)
     label: int | None = None
     quality: List[float] | None = None
+    costs: List[float] | None = None
 
 
 def split_dataset(items: List[TrainItem], val_ratio: float = 0.2, seed: int = 42) -> Tuple[List[TrainItem], List[TrainItem]]:
@@ -32,6 +33,13 @@ def extract_xy(items: List[TrainItem]) -> Tuple[List[str], List[Dict[str, str]],
     qualities = [it.quality for it in items if it.quality is not None]
     qualities_out = qualities if len(qualities) == len(items) else None
     return texts, feats, labels_out, qualities_out
+
+
+def extract_xy_with_costs(items: List[TrainItem]) -> Tuple[List[str], List[Dict[str, str]], list[int] | None, list[list[float]] | None, list[list[float]] | None]:
+    texts, feats, labels_out, qualities_out = extract_xy(items)
+    costs = [it.costs for it in items if it.costs is not None]
+    costs_out = costs if len(costs) == len(items) else None
+    return texts, feats, labels_out, qualities_out, costs_out
 
 
 def load_routerbench_default(path: str | Path) -> List[TrainItem]:
@@ -53,11 +61,12 @@ def parse_routerbench(path: str | Path) -> tuple[List[TrainItem], list[str], lis
         text = str(row.get("prompt", ""))
         feats: Dict[str, str] = {"eval": str(row.get("eval_name", "unknown"))}
         q = [float(row.get(m, 0.0)) for m in model_base_names]
+        c = [float(row.get(f"{m}|total_cost", 0.0)) for m in model_base_names]
         oracle = row.get("oracle_model_to_route_to")
         label = None
         if isinstance(oracle, str) and oracle in model_base_names:
             label = model_base_names.index(oracle)
-        items.append(TrainItem(text=text, features=feats, quality=q, label=label))
+        items.append(TrainItem(text=text, features=feats, quality=q, label=label, costs=c))
 
     return items, model_base_names, mean_costs
 

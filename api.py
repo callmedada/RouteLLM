@@ -24,8 +24,14 @@ class TrainRequest(BaseModel):
     num_clusters: int = 4
     beta: float = 0.1
     lambda_soft: float = 0.5
+    fusion_beta: float | None = None
     objective: str = "utility"  # 或 "min_cost"
     quality_threshold: float = 0.0
+    limbo_tau: float | None = None
+    # 其他可选的成本感知参数（保持默认）
+    cost_weight: float = 0.5
+    softmax_temperature: float = 0.5
+    blend_costaware: float = 0.5
     fuser_type: str = "mlp"  # mlp | attention
 
 
@@ -59,8 +65,13 @@ def train(req: TrainRequest, background: BackgroundTasks) -> Dict[str, str]:
             num_clusters=req.num_clusters,
             beta=req.beta,
             lambda_soft=req.lambda_soft,
+            fusion_beta=(req.fusion_beta if req.fusion_beta is not None else req.lambda_soft),
             objective=req.objective,
             quality_threshold=req.quality_threshold,
+            limbo_tau=req.limbo_tau,
+            cost_weight=req.cost_weight,
+            softmax_temperature=req.softmax_temperature,
+            blend_costaware=req.blend_costaware,
             fuser_type=req.fuser_type,
         )
         pipeline = RouterPipeline(req.model_names, req.model_costs, config)

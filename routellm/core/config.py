@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Optional
 
 
 @dataclass
 class TrainConfig:
     num_clusters: int
-    beta: float
-    lambda_soft: float
+    beta: float  # legacy: kept for compatibility; see utility_beta
+    lambda_soft: float  # legacy: mapped to fusion_beta if fusion_beta unchanged
+    # 新增：分支融合门控（β=0 -> 仅BERT；β=1 -> 仅LIMBO）
+    fusion_beta: float = 0.5
+    # 新增：LIMBO 聚类器温度/早停阈值（占位实现存储不改变逻辑）
+    limbo_tau: Optional[float] = None
+    limbo_use_sparse: bool = True
+    # 新增：簇内 utility 的成本权重别名（默认等于 legacy beta）
+    utility_beta: Optional[float] = None
     prefer_transformer: bool = True
     embedding_dim: int = 384
     fuser_hidden: Tuple[int, int] = (256, 128)
@@ -26,4 +33,17 @@ class TrainConfig:
     enable_calibration: bool = True       # 是否在验证集做温度校准（报告阶段使用）
     fallback_strategy: str = "best_fixed" # 成本-性能前沿回退策略：best_fixed|cheapest|name
     fallback_model_name: str | None = None
+
+    def __post_init__(self) -> None:
+        # legacy beta -> utility_beta（若未显式提供）
+        if self.utility_beta is None:
+            self.utility_beta = self.beta
+        # legacy lambda_soft -> fusion_beta（仅当 fusion_beta 仍为默认值）
+        # 以便旧调用只传 lambda_soft 仍可生效
+        try:
+            default_fusion_beta = type(self).fusion_beta
+        except Exception:
+            default_fusion_beta = 0.5
+        if (self.fusion_beta == default_fusion_beta) and (self.lambda_soft is not None):
+            self.fusion_beta = self.lambda_soft
 

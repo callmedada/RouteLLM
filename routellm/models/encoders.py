@@ -44,7 +44,9 @@ class SentenceTransformerEncoder(BaseTextEncoder):
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
         except Exception as exc:  # pragma: no cover
+            print("[SentenceTransformerEncoder] sentence-transformers 未安装，无法加载 Transformer 编码器", flush=True)
             raise RuntimeError("sentence-transformers 未安装") from exc
+        print(f"[SentenceTransformerEncoder] loading model: {model_name} (may download on first run)", flush=True)
         self._model = SentenceTransformer(model_name)
         self.embedding_dim = getattr(self._model, "get_sentence_embedding_dimension", lambda: embedding_dim)()
 
@@ -55,6 +57,7 @@ class SentenceTransformerEncoder(BaseTextEncoder):
                 show_progress_bar = len(texts) >= 32
             except Exception:
                 show_progress_bar = False
+        print(f"[SentenceTransformerEncoder] encoding: n={len(texts)}, progress={bool(show_progress_bar)}", flush=True)
         embeddings = self._model.encode(texts, normalize_embeddings=True, show_progress_bar=bool(show_progress_bar))
         return np.asarray(embeddings, dtype=np.float32)
 
@@ -62,8 +65,10 @@ class SentenceTransformerEncoder(BaseTextEncoder):
 def build_text_encoder(prefer_transformer: bool = True, embedding_dim: int = 384) -> BaseTextEncoder:
     if prefer_transformer:
         try:
+            print("[build_text_encoder] prefer transformer: trying SentenceTransformer", flush=True)
             return SentenceTransformerEncoder()
         except Exception:
+            print("[build_text_encoder] fallback to HashFallbackEncoder", flush=True)
             return HashFallbackEncoder(embedding_dim=embedding_dim)
     return HashFallbackEncoder(embedding_dim=embedding_dim)
 

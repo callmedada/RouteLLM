@@ -34,6 +34,8 @@ class BertBranch:
         self.encoder = build_text_encoder(prefer_transformer=prefer_transformer, embedding_dim=embedding_dim)
         self.clusterer = LimboAgglomerative(n_clusters=num_clusters)
         self.mapper = ClusterModelMapper(model_names, model_costs)
+        self.norm_min: np.ndarray | None = None
+        self.norm_max: np.ndarray | None = None
 
     @staticmethod
     def _normalize(x: np.ndarray) -> np.ndarray:
@@ -47,6 +49,10 @@ class BertBranch:
 
     def fit(self, texts: List[str], quality: np.ndarray) -> BranchResult:
         # 大批量时让底层 encoder 显示进度，小批量不显示，避免条目不连贯
+        try:
+            print(f"[BertBranch.fit] start: n_texts={len(texts)}, prefer_transformer={hasattr(self.encoder, '_model')}", flush=True)
+        except Exception:
+            pass
         X = self.encoder.encode(texts, show_progress_bar=len(texts) >= 32)
         dicts = []
         for vec in tqdm(X, desc="BERT branch normalize", leave=False):
@@ -59,14 +65,30 @@ class BertBranch:
                 v = v / s
             d = {f"f{j}": float(vj) for j, vj in enumerate(v)}
             dicts.append(d)
+        print("[BertBranch.fit] clustering ...", flush=True)
         self.clusterer.fit(dicts)
         labels = list(self.clusterer.labels_)
-        Xn = self._normalize(X)
+        # 训练期计算并记录 min/max，再用于归一化
+        if X.size == 0:
+            Xn = X
+        else:
+            min_v = X.min(axis=0, keepdims=True)
+            max_v = X.max(axis=0, keepdims=True)
+            denom = max_v - min_v
+            denom[denom == 0] = 1.0
+            self.norm_min = min_v
+            self.norm_max = max_v
+            Xn = (X - min_v) / denom
+        try:
+            print(f"[BertBranch.fit] embeddings ready: shape={X.shape}, normed_shape={Xn.shape}", flush=True)
+        except Exception:
+            pass
 
         if self.objective == "min_cost":
             self.mapper.fit_min_cost(labels, quality, self.quality_threshold)
         else:
-            self.mapper.fit(labels, quality, self.beta)
+            beta = getattr(self, "beta", 0.0)
+            self.mapper.fit(labels, quality, beta)
 
         y = np.zeros((len(labels), len(self.model_names)), dtype=np.float32)
         for i, c in enumerate(labels):
@@ -82,5 +104,26 @@ class BertBranch:
             name = self.mapper.mapping[c]
             y[i, self.model_names.index(name)] = 1.0
 
+        print(f"[BertBranch.fit] done: labels={len(labels)}, y_shape={y.shape}", flush=True)
         return BranchResult(labels=labels, representation=Xn, soft_labels=y)
+
+    def transform_texts(self, texts: List[str], show_progress_bar: bool = False) -> np.ndarray:
+        try:
+            print(f"[BertBranch.transform_texts] n={len(texts)}", flush=True)
+        except Exception:
+            pass
+        X_raw = self.encoder.encode(texts, show_progress_bar=show_progress_bar)
+        if X_raw.size == 0:
+            return X_raw
+        if self.norm_min is not None and self.norm_max is not None:
+            denom = self.norm_max - self.norm_min
+            denom = np.where(denom == 0, 1.0, denom)
+            return (X_raw - self.norm_min) / denom
+        if X_raw.shape[0] <= 1:
+            return X_raw
+        min_v = X_raw.min(axis=0, keepdims=True)
+        max_v = X_raw.max(axis=0, keepdims=True)
+        denom = max_v - min_v
+        denom[denom == 0] = 1.0
+        return (X_raw - min_v) / denom
 

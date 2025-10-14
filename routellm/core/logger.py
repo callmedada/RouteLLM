@@ -3,9 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, is_dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 
 @dataclass
@@ -27,7 +27,7 @@ class RunLogger:
         run_dir.mkdir(parents=True, exist_ok=True)
         return RunInfo(run_id=run_id, run_dir=run_dir)
 
-    def log_metrics(self, run: RunInfo, metrics: Dict[str, float]) -> None:
+    def log_metrics(self, run: RunInfo, metrics: Dict[str, float], *, config: Optional[Any] = None, extra: Optional[Dict[str, Any]] = None) -> None:
         csv_path = run.run_dir / "metrics.csv"
         json_path = run.run_dir / "metrics.json"
 
@@ -37,5 +37,19 @@ class RunLogger:
                 writer.writerow([k, v])
 
         with json_path.open("w", encoding="utf-8") as f:
-            json.dump(metrics, f, ensure_ascii=False)
+            payload: Dict[str, Any] = {"metrics": metrics}
+            if config is not None:
+                if is_dataclass(config):
+                    payload["config"] = asdict(config)
+                elif isinstance(config, dict):
+                    payload["config"] = config
+                else:
+                    # best-effort stringify
+                    try:
+                        payload["config"] = asdict(config)  # type: ignore[arg-type]
+                    except Exception:
+                        payload["config"] = str(config)
+            if extra:
+                payload.update(extra)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
 

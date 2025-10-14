@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .pipeline import RouterPipeline, TrainConfig
-from .data import TrainItem, split_dataset, extract_xy, load_routerbench_default, parse_routerbench
+from .data import TrainItem, split_dataset, extract_xy, extract_xy_with_costs, load_routerbench_default, parse_routerbench
 from .logger import RunLogger
 from .report import generate_evaluation_report
 
@@ -17,25 +17,31 @@ def train_and_eval(
     config: TrainConfig,
     val_ratio: float = 0.2,
 ) -> Dict[str, float]:
+    print(f"[train_and_eval] items={len(items)}, val_ratio={val_ratio}", flush=True)
     train_items, val_items = split_dataset(items, val_ratio=val_ratio)
     tr_texts, tr_feats, tr_labels, tr_q = extract_xy(train_items)
-    vl_texts, vl_feats, vl_labels, _ = extract_xy(val_items)
+    vl_texts, vl_feats, vl_labels, _, vl_costs = extract_xy_with_costs(val_items)
+    print(f"[train_and_eval] split: train={len(tr_texts)}, val={len(vl_texts)}", flush=True)
     quality = None
     if tr_q is not None:
         quality = np.asarray(tr_q, dtype=np.float32)
 
+    print("[train_and_eval] build pipeline", flush=True)
     pipeline = RouterPipeline(model_names, model_costs, config)
+    print("[train_and_eval] fitting pipeline", flush=True)
     pipeline.fit(tr_texts, tr_feats, quality=quality)
-    metrics = pipeline.evaluate(vl_texts, vl_feats, vl_labels)
+    print("[train_and_eval] evaluating pipeline", flush=True)
+    metrics = pipeline.evaluate(vl_texts, vl_feats, vl_labels, sample_costs=vl_costs)
     # 记录日志
     logger = RunLogger()
     run = logger.create()
-    logger.log_metrics(run, metrics)
+    # 将训练配置也写入 metrics.json
+    logger.log_metrics(run, metrics, config=config)
     # 生成详细评估报告（若存在标签）
     # 允许部分样本无标签：直接使用 val_items 的 label 列表（含 None）
     try:
         vl_labels_full = [it.label for it in val_items]
-        generate_evaluation_report(
+        result = generate_evaluation_report(
             pipeline,
             vl_texts,
             vl_feats,
@@ -46,7 +52,19 @@ def train_and_eval(
             enable_calibration=config.enable_calibration,
             fallback_strategy=config.fallback_strategy,
             fallback_model_name=config.fallback_model_name,
+            per_sample_costs=vl_costs,
         )
+        # 在 evaluation.json 中追加 config 字段
+        try:
+            import json, os
+            eval_json_path = os.path.join(str(run.run_dir), "evaluation.json")
+            with open(eval_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data["config"] = getattr(pipeline, "config", None).__dict__ if hasattr(pipeline, "config") else config.__dict__
+            with open(eval_json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
     except Exception:
         pass
     return metrics

@@ -31,6 +31,10 @@ class MLPFuserTorch(nn.Module):
 def train_fuser(model: MLPFuserTorch, x: torch.Tensor, y_soft: torch.Tensor, epochs: int = 200, lr: float = 1e-2, batch_size: int = 64, use_tqdm: bool = True) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     n = x.size(0)
+    try:
+        print(f"[train_fuser] start: n={n}, epochs={epochs}, batch_size={batch_size}, lr={lr}", flush=True)
+    except Exception:
+        pass
     epoch_iter = tqdm(range(epochs), desc="Fuser training", leave=False) if use_tqdm else range(epochs)
     for _ in epoch_iter:
         perm = torch.randperm(n)

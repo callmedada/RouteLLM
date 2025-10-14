@@ -20,15 +20,6 @@ except Exception:  # pragma: no cover
         return x
 
 
-@dataclass
-# 也许我们可以把所有tunable的hyperparameter都写在这边？
-# 目前有你的那三个可以控制weighting of cost and performance
-# 现在加了beta
-# 还差LIMBO的tau。然后再做grid search？
-class TrainConfig(TrainConfig):
-    beta: float = 0.5 # alpha controls the weighting. 1 means all LIMBO, 0 means all BERT.
-
-
 class RouterPipeline:
     """
     - LIMBO 
@@ -43,18 +34,40 @@ class RouterPipeline:
 
         # 分支模块
         self.limbo_branch = LimboBranch(
-            model_names, model_costs, config.num_clusters, config.beta, config.objective, config.quality_threshold
+            model_names,
+            model_costs,
+            config.num_clusters,
+            # 传入用于 utility 的 beta（兼容：config.utility_beta 默认为 legacy beta）
+            getattr(config, "utility_beta", config.beta),
+            config.objective,
+            config.quality_threshold,
+            limbo_tau=getattr(config, "limbo_tau", None),
+            limbo_use_sparse=getattr(config, "limbo_use_sparse", True),
         )
         self.bert_branch = BertBranch(
-            model_names, model_costs, config.num_clusters, config.beta, config.objective, config.quality_threshold,
+            model_names,
+            model_costs,
+            config.num_clusters,
+            getattr(config, "utility_beta", config.beta),
+            config.objective,
+            config.quality_threshold,
             prefer_transformer=config.prefer_transformer, embedding_dim=config.embedding_dim,
         )
 
         # todo 是不是有点问题这块
         self.fuser_torch: Optional[MLPFuserTorch] = None
+        # 训练期融合输入的归一化参数，推理/评估阶段复用
+        self._norm_min: np.ndarray | None = None
+        self._norm_max: np.ndarray | None = None
 
     def _normalize(self, x: np.ndarray) -> np.ndarray:
         if x.size == 0:
+            return x
+        if self._norm_min is not None and self._norm_max is not None:
+            denom = self._norm_max - self._norm_min
+            denom = np.where(denom == 0, 1.0, denom)
+            return (x - self._norm_min) / denom
+        if x.shape[0] <= 1:
             return x
         min_v = x.min(axis=0, keepdims=True)
         max_v = x.max(axis=0, keepdims=True)
@@ -65,14 +78,29 @@ class RouterPipeline:
     def fit(self, queries_text: List[str], queries_features: List[Dict[str, str]], quality: Optional[np.ndarray] = None) -> None:
         n = len(queries_text)
         m = len(self.model_names)
+        try:
+            print(f"[RouterPipeline.fit] start: n_texts={n}, n_models={m}", flush=True)
+            print(f"[RouterPipeline.fit] config: fuser_type={self.config.fuser_type}, num_clusters={self.config.num_clusters}, fusion_beta={getattr(self.config, 'fusion_beta', None)}", flush=True)
+        except Exception:
+            pass
         if quality is None:
             quality = np.random.rand(n, m).astype(np.float32)
         cost = np.asarray(self.model_costs, dtype=np.float32)
 
         # 1) 两个分支
         if getattr(self.config, "show_progress", True):
+            print("[RouterPipeline.fit] LIMBO branch: fitting ...", flush=True)
             limbo_res = self.limbo_branch.fit(queries_features, quality)
+            try:
+                print(f"[RouterPipeline.fit] LIMBO done: rep_shape={getattr(limbo_res, 'representation', np.empty((0,0))).shape}", flush=True)
+            except Exception:
+                pass
+            print("[RouterPipeline.fit] BERT branch: encoding & fitting ...", flush=True)
             bert_res = self.bert_branch.fit(queries_text, quality)
+            try:
+                print(f"[RouterPipeline.fit] BERT done: rep_shape={getattr(bert_res, 'representation', np.empty((0,0))).shape}", flush=True)
+            except Exception:
+                pass
         else:
             limbo_res = self.limbo_branch.fit(queries_features, quality)
             bert_res = self.bert_branch.fit(queries_text, quality)
@@ -80,7 +108,13 @@ class RouterPipeline:
         # 2) 生成软标签（分支）
         y_limbo = limbo_res.soft_labels
         y_bert = bert_res.soft_labels
-        y_branch = self.config.lambda_soft * y_limbo + (1.0 - self.config.lambda_soft) * y_bert
+        fusion_beta = float(getattr(self.config, "fusion_beta", self.config.lambda_soft))
+        fusion_beta = max(0.0, min(1.0, fusion_beta))
+        y_branch = fusion_beta * y_limbo + (1.0 - fusion_beta) * y_bert
+        try:
+            print(f"[RouterPipeline.fit] branch soft labels prepared: shape={y_branch.shape}, fusion_beta={fusion_beta}", flush=True)
+        except Exception:
+            pass
 
         # 2.1) 成本感知目标分布：使用质量(0/1)与成本
         alpha = float(getattr(self.config, "cost_weight", 0.5))
@@ -99,9 +133,28 @@ class RouterPipeline:
 
         # 2.2) 融合目标
         y_target = gamma * p_costaware + (1.0 - gamma) * y_branch
+        try:
+            print(f"[RouterPipeline.fit] cost-aware target prepared: shape={y_target.shape} (alpha={alpha}, tau={tau}, gamma={gamma})", flush=True)
+        except Exception:
+            pass
 
         # 3) 融合输入
         X_fuse = np.hstack([limbo_res.representation, bert_res.representation])
+        # 门控缩放：先缩放后归一化统计
+        limbo_dim = limbo_res.representation.shape[1]
+        bert_dim = bert_res.representation.shape[1]
+        if X_fuse.size > 0 and (limbo_dim + bert_dim) == X_fuse.shape[1]:
+            X_fuse = X_fuse.copy()
+            X_fuse[:, :limbo_dim] *= fusion_beta
+            X_fuse[:, limbo_dim:] *= (1.0 - fusion_beta)
+        # 记录训练期 min/max，用于推理/评估阶段归一化保持一致
+        if X_fuse.size > 0:
+            self._norm_min = X_fuse.min(axis=0, keepdims=True)
+            self._norm_max = X_fuse.max(axis=0, keepdims=True)
+        try:
+            print(f"[RouterPipeline.fit] fusion features ready: shape={X_fuse.shape}", flush=True)
+        except Exception:
+            pass
 
         # 4) 融合
         import torch
@@ -112,9 +165,11 @@ class RouterPipeline:
             x_t = torch.from_numpy(X_fuse.astype(np.float32))
             y_t = torch.from_numpy(y_target.astype(np.float32))
             # 共享训练函数
+            print(f"[RouterPipeline.fit] training Attention fuser: samples={x_t.size(0)}, epochs={self.config.fuser_epochs}, lr={self.config.fuser_lr}", flush=True)
             train_fuser(self.fuser_torch, x_t, y_t, epochs=self.config.fuser_epochs, lr=self.config.fuser_lr, use_tqdm=getattr(self.config, "show_progress", True))
         else:
             self.fuser_torch = MLPFuserTorch(input_dim=X_fuse.shape[1], num_models=m, hidden_dims=self.config.fuser_hidden)
+            print(f"[RouterPipeline.fit] training MLP fuser: samples={X_fuse.shape[0]}, input_dim={X_fuse.shape[1]}, epochs={self.config.fuser_epochs}, lr={self.config.fuser_lr}", flush=True)
             train_fuser(
                 self.fuser_torch,
                 torch.from_numpy(X_fuse.astype(np.float32)),
@@ -123,6 +178,10 @@ class RouterPipeline:
                 lr=self.config.fuser_lr,
                 use_tqdm=getattr(self.config, "show_progress", True),
             )
+        try:
+            print("[RouterPipeline.fit] fuser training finished", flush=True)
+        except Exception:
+            pass
 
     def _fit_mapper(self, mapper: ClusterModelMapper, labels: List[int], quality: np.ndarray) -> None:
         # temp temp
@@ -134,21 +193,21 @@ class RouterPipeline:
     def predict(self, query_text: str, query_features: Dict[str, str]) -> Tuple[str, float, int]:
         if self.fuser_torch is None:
             raise RuntimeError("Pipeline not fitted")
-        
-        # fetching beta
-        beta = float(getattr(self.config, "beta", 0.5))
-        if beta < 0 or beta > 1:
-            raise RuntimeError("Beta must be in the range of [0, 1].")
 
-        # fusion here
+        # fusion here：先拼接，再用训练期统计量统一归一化
         x_limbo = self.limbo_branch.vectorizer.transform([query_features])
-        # 单条预测禁用编码器内部进度，避免不连贯
-        x_bert = self.bert_branch.encoder.encode([query_text], show_progress_bar=False)
-        # fusing two branches with beta
-        x = np.hstack([
-            self._normalize(x_limbo) * beta, 
-            self._normalize(x_bert) * (1 - beta),
-        ])
+        x_bert = self.bert_branch.transform_texts([query_text], show_progress_bar=False)
+        x = np.hstack([x_limbo, x_bert])
+        # 门控缩放：与训练一致
+        fusion_beta = float(getattr(self.config, "fusion_beta", self.config.lambda_soft))
+        fusion_beta = max(0.0, min(1.0, fusion_beta))
+        limbo_dim = x_limbo.shape[1]
+        bert_dim = x_bert.shape[1]
+        if x.size > 0 and (limbo_dim + bert_dim) == x.shape[1]:
+            x = x.copy()
+            x[:, :limbo_dim] *= fusion_beta
+            x[:, limbo_dim:] *= (1.0 - fusion_beta)
+        x = self._normalize(x)
 
         import torch
 
@@ -159,15 +218,32 @@ class RouterPipeline:
         return self.model_names[idx], float(probs[idx]), idx
 
     # evaluate
-    def evaluate(self, texts: List[str], features: List[Dict[str, str]], labels: Optional[List[int]] = None) -> Dict[str, float]:
+    def evaluate(self, texts: List[str], features: List[Dict[str, str]], labels: Optional[List[int]] = None, sample_costs: Optional[List[List[float]]] = None) -> Dict[str, float]:
+        try:
+            print(f"[RouterPipeline.evaluate] start: n={len(texts)}", flush=True)
+        except Exception:
+            pass
         hits = 0
         costs: List[float] = []
         preds: List[int] = []
         route_hist = {name: 0 for name in self.model_names}
 
         x_limbo = self.limbo_branch.vectorizer.transform(features)
-        x_bert = self.bert_branch.encoder.encode(texts, show_progress_bar=False)
-        xn = np.hstack([self._normalize(x_limbo), self._normalize(x_bert)])
+        x_bert = self.bert_branch.transform_texts(texts, show_progress_bar=False)
+        xn = np.hstack([x_limbo, x_bert])
+        try:
+            print(f"[RouterPipeline.evaluate] features ready: limbo={x_limbo.shape}, bert={x_bert.shape}, fused={xn.shape}", flush=True)
+        except Exception:
+            pass
+        fusion_beta = float(getattr(self.config, "fusion_beta", self.config.lambda_soft))
+        fusion_beta = max(0.0, min(1.0, fusion_beta))
+        limbo_dim = x_limbo.shape[1]
+        bert_dim = x_bert.shape[1]
+        if xn.size > 0 and (limbo_dim + bert_dim) == xn.shape[1]:
+            xn = xn.copy()
+            xn[:, :limbo_dim] *= fusion_beta
+            xn[:, limbo_dim:] *= (1.0 - fusion_beta)
+        xn = self._normalize(xn)
 
         import torch
         iterator = range(len(texts))
@@ -179,7 +255,14 @@ class RouterPipeline:
                 probs = logp.exp().numpy()[0]
                 idx = int(np.argmax(probs))
                 preds.append(idx)
-                costs.append(float(self.model_costs[idx]))
+                if sample_costs is not None and i < len(sample_costs):
+                    row = sample_costs[i]
+                    if isinstance(row, (list, tuple)) and len(row) == len(self.model_names):
+                        costs.append(float(row[idx]))
+                    else:
+                        costs.append(float(self.model_costs[idx]))
+                else:
+                    costs.append(float(self.model_costs[idx]))
                 route_hist[self.model_names[idx]] += 1
                 if labels is not None and i < len(labels):
                     hits += int(idx == labels[i])
@@ -234,11 +317,19 @@ class RouterPipeline:
 
             # 最便宜固定模型（参考）
             if len(self.model_costs) > 0:
-                costs_arr = np.asarray(self.model_costs, dtype=np.float32)
-                min_cost_idx = int(np.argmin(costs_arr))
-                metrics["baseline_cheapest_model"] = float(min_cost_idx)
-                metrics["baseline_cheapest_model_name"] = self.model_names[min_cost_idx]
-                metrics["baseline_cheapest_cost"] = float(costs_arr[min_cost_idx])
+                if sample_costs is not None and len(sample_costs) == len(texts):
+                    costs_mat = np.asarray(sample_costs, dtype=np.float32)
+                    per_model_avg = costs_mat.mean(axis=0)
+                    min_cost_idx = int(np.argmin(per_model_avg))
+                    metrics["baseline_cheapest_model"] = float(min_cost_idx)
+                    metrics["baseline_cheapest_model_name"] = self.model_names[min_cost_idx]
+                    metrics["baseline_cheapest_cost"] = float(per_model_avg[min_cost_idx])
+                else:
+                    costs_arr = np.asarray(self.model_costs, dtype=np.float32)
+                    min_cost_idx = int(np.argmin(costs_arr))
+                    metrics["baseline_cheapest_model"] = float(min_cost_idx)
+                    metrics["baseline_cheapest_model_name"] = self.model_names[min_cost_idx]
+                    metrics["baseline_cheapest_cost"] = float(costs_arr[min_cost_idx])
 
         return metrics
 

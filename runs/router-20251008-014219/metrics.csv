@@ -1,0 +1,12 @@
+avg_cost,0.00011187600000000001
+route_gpt-3.5-turbo-1106,0.0
+route_claude-instant-v1,0.0
+route_claude-v1,0.0
+route_claude-v2,0.0
+route_gpt-4-1106-preview,0.006666666666666667
+route_meta/llama-2-70b-chat,0.0
+route_mistralai/mixtral-8x7b-chat,0.0
+route_zero-one-ai/Yi-34B-Chat,0.0
+route_WizardLM/WizardLM-13B-V1.2,0.0
+route_meta/code-llama-instruct-34b-chat,0.0
+route_mistralai/mistral-7b-chat,0.9933333333333333
