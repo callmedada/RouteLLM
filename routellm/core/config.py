@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -33,6 +33,17 @@ class TrainConfig:
     enable_calibration: bool = True       # 是否在验证集做温度校准（报告阶段使用）
     fallback_strategy: str = "best_fixed" # 成本-性能前沿回退策略：best_fixed|cheapest|name
     fallback_model_name: str | None = None
+    limbo_input_dump_path: str | None = None
+    use_query_features: bool = True
+    use_spacy_features: bool = True
+    spacy_model: str = "en_core_web_sm"
+    spacy_enable_components: Tuple[str, ...] = ("tok2vec", "tagger", "parser", "ner")
+    query_hash_buckets: int = 128
+    query_max_hash_per_ngram: int = 64
+    query_embed_k: Optional[int] = None
+    limbo_coarse_clusters: Optional[int] = None
+    limbo_fit_size: int = 2000
+    limbo_prob_temp: float = 1.0
 
     def __post_init__(self) -> None:
         # legacy beta -> utility_beta（若未显式提供）
@@ -46,4 +57,10 @@ class TrainConfig:
             default_fusion_beta = 0.5
         if (self.fusion_beta == default_fusion_beta) and (self.lambda_soft is not None):
             self.fusion_beta = self.lambda_soft
+
+        if not self.use_spacy_features:
+            raise ValueError("use_spacy_features 必须为 True，以确保启用 spaCy 特征")
+
+        if self.query_embed_k is not None and self.query_embed_k <= 0:
+            raise ValueError("query_embed_k 必须为正整数或 None")
 

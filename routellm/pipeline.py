@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -10,6 +10,7 @@ from .mapping import ClusterModelMapper
 from .branches.limbo_branch import LimboBranch
 from .branches.bert_branch import BertBranch
 from .models.fusion_torch import MLPFuserTorch, AttentionFuserTorch, train_fuser
+from .features import QueryFeatureExtractor
 from limbo_cluster import LimboAgglomerative  
 from .logger import RunLogger, RunInfo
 from .core import TrainConfig
@@ -33,6 +34,10 @@ class RouterPipeline:
         self.config = config
 
         # 分支模块
+        limbo_coarse_clusters = getattr(config, "limbo_coarse_clusters", None)
+        limbo_fit_size = getattr(config, "limbo_fit_size", 2000)
+        limbo_prob_temp = getattr(config, "limbo_prob_temp", 1.0)
+        limbo_random_state = getattr(config, "seed", 42)
         self.limbo_branch = LimboBranch(
             model_names,
             model_costs,
@@ -43,6 +48,12 @@ class RouterPipeline:
             config.quality_threshold,
             limbo_tau=getattr(config, "limbo_tau", None),
             limbo_use_sparse=getattr(config, "limbo_use_sparse", True),
+            input_dump_path=getattr(config, "limbo_input_dump_path", None),
+            coarse_clusters=limbo_coarse_clusters,
+            limbo_fit_size=limbo_fit_size,
+            prob_temp=limbo_prob_temp,
+            random_state=limbo_random_state,
+            progress_logging=getattr(config, "show_progress", True),
         )
         self.bert_branch = BertBranch(
             model_names,
@@ -59,6 +70,18 @@ class RouterPipeline:
         # 训练期融合输入的归一化参数，推理/评估阶段复用
         self._norm_min: np.ndarray | None = None
         self._norm_max: np.ndarray | None = None
+        self._query_feature_extractor: QueryFeatureExtractor | None = None
+        if getattr(config, "use_query_features", True):
+            self._query_feature_extractor = QueryFeatureExtractor(
+                hash_buckets=getattr(config, "query_hash_buckets", 128),
+                max_hash_per_ngram=getattr(config, "query_max_hash_per_ngram", 64),
+                spacy_model=getattr(config, "spacy_model", "en_core_web_sm"),
+                spacy_components=getattr(config, "spacy_enable_components", ("tok2vec", "tagger", "parser", "ner")),
+            )
+        self._embed_cluster_model: object | None = None
+        self._embed_cluster_key: str | None = None
+        self._limbo_summary: Dict[str, Any] | None = None
+        self._limbo_cluster_profiles: List[Dict[str, object]] | None = None
 
     def _normalize(self, x: np.ndarray) -> np.ndarray:
         if x.size == 0:
@@ -75,6 +98,58 @@ class RouterPipeline:
         denom[denom == 0] = 1.0
         return (x - min_v) / denom
 
+    def _extract_query_features(self, texts: Sequence[str]) -> List[Dict[str, str]]:
+        if self._query_feature_extractor is None:
+            return [dict() for _ in texts]
+        return self._query_feature_extractor.extract(list(texts))
+
+    def _merge_features(
+        self,
+        original: Sequence[Optional[Dict[str, str]]],
+        auto_features: Sequence[Dict[str, str]],
+    ) -> List[Dict[str, str]]:
+        merged: List[Dict[str, str]] = []
+        for base, extra in zip(original, auto_features):
+            combined: Dict[str, str] = {}
+            if base:
+                for k, v in base.items():
+                    combined[str(k)] = "" if v is None else str(v)
+            combined.update(extra)
+            merged.append(combined)
+        return merged
+
+    def _fit_embed_clusters(self, embeddings: np.ndarray, k: int) -> np.ndarray:
+        if embeddings.size == 0 or embeddings.shape[0] == 0:
+            self._embed_cluster_model = None
+            self._embed_cluster_key = None
+            return np.zeros((embeddings.shape[0],), dtype=np.int32)
+        try:
+            from sklearn.cluster import KMeans  # type: ignore
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("启用 query_embed_k 需要安装 scikit-learn：pip install scikit-learn") from exc
+        random_state = getattr(self.config, "seed", 42)
+        kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=10)
+        labels = kmeans.fit_predict(embeddings.astype(np.float32))
+        self._embed_cluster_model = kmeans
+        self._embed_cluster_key = f"embed_cluster_{k}"
+        return labels.astype(np.int32)
+
+    def _predict_embed_clusters(self, texts: Sequence[str]) -> np.ndarray:
+        if self._embed_cluster_model is None or self._embed_cluster_key is None:
+            raise RuntimeError("嵌入簇模型尚未训练，无法推断 embed_cluster 特征")
+        embeddings = self.bert_branch.transform_texts(list(texts), show_progress_bar=False)
+        if embeddings.size == 0:
+            return np.zeros((len(texts),), dtype=np.int32)
+        model = self._embed_cluster_model  # type: ignore[assignment]
+        labels = model.predict(embeddings)  # type: ignore[attr-defined]
+        return np.asarray(labels, dtype=np.int32)
+
+    def _attach_embed_labels(self, auto_features: Sequence[Dict[str, str]], labels: np.ndarray) -> None:
+        if self._embed_cluster_key is None:
+            return
+        for feat, label in zip(auto_features, labels):
+            feat[self._embed_cluster_key] = str(int(label))
+
     def fit(self, queries_text: List[str], queries_features: List[Dict[str, str]], quality: Optional[np.ndarray] = None) -> None:
         n = len(queries_text)
         m = len(self.model_names)
@@ -87,23 +162,49 @@ class RouterPipeline:
             quality = np.random.rand(n, m).astype(np.float32)
         cost = np.asarray(self.model_costs, dtype=np.float32)
 
-        # 1) 两个分支
-        if getattr(self.config, "show_progress", True):
-            print("[RouterPipeline.fit] LIMBO branch: fitting ...", flush=True)
-            limbo_res = self.limbo_branch.fit(queries_features, quality)
-            try:
-                print(f"[RouterPipeline.fit] LIMBO done: rep_shape={getattr(limbo_res, 'representation', np.empty((0,0))).shape}", flush=True)
-            except Exception:
-                pass
+        show_progress = bool(getattr(self.config, "show_progress", True))
+
+        auto_features = self._extract_query_features(queries_text)
+        self._embed_cluster_model = None
+        self._embed_cluster_key = None
+
+        if show_progress:
             print("[RouterPipeline.fit] BERT branch: encoding & fitting ...", flush=True)
-            bert_res = self.bert_branch.fit(queries_text, quality)
-            try:
-                print(f"[RouterPipeline.fit] BERT done: rep_shape={getattr(bert_res, 'representation', np.empty((0,0))).shape}", flush=True)
-            except Exception:
-                pass
-        else:
-            limbo_res = self.limbo_branch.fit(queries_features, quality)
-            bert_res = self.bert_branch.fit(queries_text, quality)
+        bert_res = self.bert_branch.fit(queries_text, quality)
+        try:
+            print(f"[RouterPipeline.fit] BERT done: rep_shape={getattr(bert_res, 'representation', np.empty((0, 0))).shape}", flush=True)
+        except Exception:
+            pass
+
+        embed_k = getattr(self.config, "query_embed_k", None)
+        if embed_k is not None:
+            labels = self._fit_embed_clusters(bert_res.representation, int(embed_k))
+            self._attach_embed_labels(auto_features, labels)
+
+        merged_features = self._merge_features(queries_features, auto_features)
+        if show_progress:
+            print(f"[RouterPipeline.fit] merged LIMBO feature example: keys={list(merged_features[0].keys())[:10]}", flush=True)
+
+        if show_progress:
+            print("[RouterPipeline.fit] LIMBO branch: fitting ...", flush=True)
+        limbo_res = self.limbo_branch.fit(merged_features, quality)
+        try:
+            print(f"[RouterPipeline.fit] LIMBO done: rep_shape={getattr(limbo_res, 'representation', np.empty((0, 0))).shape}", flush=True)
+        except Exception:
+            pass
+        try:
+            summary = self.limbo_branch.summary(top_k=5)
+            self._limbo_summary = summary
+            print(f"[RouterPipeline.fit] LIMBO summary: {summary}", flush=True)
+        except Exception:
+            self._limbo_summary = None
+        try:
+            profiles = self.limbo_branch.cluster_profiles()
+            self._limbo_cluster_profiles = profiles
+            preview = profiles[: min(3, len(profiles))]
+            print(f"[RouterPipeline.fit] LIMBO cluster profiles preview: {preview}", flush=True)
+        except Exception:
+            self._limbo_cluster_profiles = None
 
         # 2) 生成软标签（分支）
         y_limbo = limbo_res.soft_labels
@@ -190,12 +291,26 @@ class RouterPipeline:
         else:
             mapper.fit(labels, quality, self.config.beta)
 
+    @property
+    def limbo_summary(self) -> Optional[Dict[str, Any]]:
+        return self._limbo_summary
+
+    @property
+    def limbo_cluster_profiles(self) -> Optional[List[Dict[str, float]]]:
+        return self._limbo_cluster_profiles
+
     def predict(self, query_text: str, query_features: Dict[str, str]) -> Tuple[str, float, int]:
         if self.fuser_torch is None:
             raise RuntimeError("Pipeline not fitted")
 
+        auto_feats = self._extract_query_features([query_text])
+        if self._embed_cluster_key is not None:
+            labels = self._predict_embed_clusters([query_text])
+            self._attach_embed_labels(auto_feats, labels)
+        merged = self._merge_features([query_features], auto_feats)
+
         # fusion here：先拼接，再用训练期统计量统一归一化
-        x_limbo = self.limbo_branch.vectorizer.transform([query_features])
+        x_limbo = self.limbo_branch.vectorizer.transform(merged)
         x_bert = self.bert_branch.transform_texts([query_text], show_progress_bar=False)
         x = np.hstack([x_limbo, x_bert])
         # 门控缩放：与训练一致
@@ -228,7 +343,13 @@ class RouterPipeline:
         preds: List[int] = []
         route_hist = {name: 0 for name in self.model_names}
 
-        x_limbo = self.limbo_branch.vectorizer.transform(features)
+        auto_feats = self._extract_query_features(texts)
+        if self._embed_cluster_key is not None:
+            labels_embed = self._predict_embed_clusters(texts)
+            self._attach_embed_labels(auto_feats, labels_embed)
+        merged_features = self._merge_features(features, auto_feats)
+
+        x_limbo = self.limbo_branch.vectorizer.transform(merged_features)
         x_bert = self.bert_branch.transform_texts(texts, show_progress_bar=False)
         xn = np.hstack([x_limbo, x_bert])
         try:

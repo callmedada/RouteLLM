@@ -23,17 +23,26 @@ def grid_search_routerbench(
     routerbench_path: str,
     lambda_list: Iterable[float],
     threshold_list: Iterable[float],
-    fuser_types: Iterable[str] = ("mlp", "attention"),
+    fuser_types: Iterable[str] = ("mlp"),
     num_clusters_list: Iterable[int] = (4,),
     fusion_betas: Optional[Iterable[float]] = None,
     limbo_taus: Optional[Iterable[Optional[float]]] = None,
     val_ratio: float = 0.2,
+    *,
+    use_query_features: bool = True,
+    spacy_model: str = "en_core_web_sm",
+    spacy_components: Optional[Iterable[str]] = None,
+    query_hash_buckets: int = 128,
+    query_max_hash_per_ngram: int = 64,
+    query_embed_k: Optional[int] = None,
 ) -> List[Tuple[Dict[str, float], TrainConfig]]:
     results: List[Tuple[Dict[str, float], TrainConfig]] = []
     # 若未显式提供 fusion_betas，则在循环内采用 lambda 作为 fusion_beta；
     # 若未显式提供 limbo_taus，则使用数值默认 0.5（不可为 None）。
     fb_list = list(fusion_betas) if fusion_betas is not None else [0.5]
     tau_list = list(limbo_taus) if limbo_taus is not None else [0.5]
+
+    components_tuple = tuple(spacy_components) if spacy_components is not None else ("tok2vec", "tagger", "parser", "ner")
 
     cluster_values = list(num_clusters_list)
     fuser_values = list(fuser_types)
@@ -85,6 +94,13 @@ def grid_search_routerbench(
             quality_threshold=thr,
             limbo_tau=actual_tau,
             fuser_type=fuser,
+            use_query_features=use_query_features,
+            use_spacy_features=True,
+            spacy_model=spacy_model,
+            spacy_enable_components=components_tuple,
+            query_hash_buckets=query_hash_buckets,
+            query_max_hash_per_ngram=query_max_hash_per_ngram,
+            query_embed_k=query_embed_k,
         )
         metrics = train_and_eval_from_routerbench(
             routerbench_path, None, None, cfg, val_ratio=val_ratio

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+import json
+import os
 import numpy as np
 
 from .pipeline import RouterPipeline, TrainConfig
@@ -56,7 +58,6 @@ def train_and_eval(
         )
         # 在 evaluation.json 中追加 config 字段
         try:
-            import json, os
             eval_json_path = os.path.join(str(run.run_dir), "evaluation.json")
             with open(eval_json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -67,6 +68,17 @@ def train_and_eval(
             pass
     except Exception:
         pass
+
+    try:
+        cluster_path = run.run_dir / "limbo_clusters.json"
+        cluster_data = pipeline.limbo_branch.collect_cluster_details()
+        with cluster_path.open("w", encoding="utf-8") as f:
+            json.dump(cluster_data, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        try:
+            print(f"[train_and_eval] failed to dump LIMBO clusters: {exc}", flush=True)
+        except Exception:
+            pass
     return metrics
 
 

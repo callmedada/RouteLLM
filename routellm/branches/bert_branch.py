@@ -6,13 +6,6 @@ from typing import List
 import numpy as np
 
 from ..encoders import build_text_encoder
-try:
-    from tqdm.auto import tqdm  # type: ignore
-except Exception:  # pragma: no cover
-    def tqdm(x, **kwargs):  # type: ignore
-        return x
-from ..mapping import ClusterModelMapper
-from limbo_cluster import LimboAgglomerative
 
 
 @dataclass
@@ -32,8 +25,6 @@ class BertBranch:
         self.quality_threshold = quality_threshold
 
         self.encoder = build_text_encoder(prefer_transformer=prefer_transformer, embedding_dim=embedding_dim)
-        self.clusterer = LimboAgglomerative(n_clusters=num_clusters)
-        self.mapper = ClusterModelMapper(model_names, model_costs)
         self.norm_min: np.ndarray | None = None
         self.norm_max: np.ndarray | None = None
 
@@ -54,21 +45,6 @@ class BertBranch:
         except Exception:
             pass
         X = self.encoder.encode(texts, show_progress_bar=len(texts) >= 32)
-        dicts = []
-        for vec in tqdm(X, desc="BERT branch normalize", leave=False):
-            v = np.asarray(vec, dtype=np.float32)
-            v = v - v.min()  # 移动到非负
-            s = float(v.sum())
-            if s <= 0:
-                v = np.ones_like(v) / max(1, len(v))
-            else:
-                v = v / s
-            d = {f"f{j}": float(vj) for j, vj in enumerate(v)}
-            dicts.append(d)
-        print("[BertBranch.fit] clustering ...", flush=True)
-        self.clusterer.fit(dicts)
-        labels = list(self.clusterer.labels_)
-        # 训练期计算并记录 min/max，再用于归一化
         if X.size == 0:
             Xn = X
         else:
@@ -84,28 +60,39 @@ class BertBranch:
         except Exception:
             pass
 
-        if self.objective == "min_cost":
-            self.mapper.fit_min_cost(labels, quality, self.quality_threshold)
-        else:
-            beta = getattr(self, "beta", 0.0)
-            self.mapper.fit(labels, quality, beta)
+        labels = list(range(len(texts)))
+        y = self._build_soft_labels(quality)
+        return BranchResult(labels=labels, representation=Xn, soft_labels=y)
 
-        y = np.zeros((len(labels), len(self.model_names)), dtype=np.float32)
-        for i, c in enumerate(labels):
-            if self.objective == "min_cost":
+    def _build_soft_labels(self, quality: np.ndarray) -> np.ndarray:
+        if quality.ndim != 2 or quality.shape[1] != len(self.model_names):
+            raise ValueError("quality 矩阵形状不匹配 BERT 分支需要的维度")
+        n, m = quality.shape
+        y = np.zeros((n, m), dtype=np.float32)
+        if self.objective == "min_cost":
+            costs = np.asarray(self.model_costs, dtype=np.float32)
+            for i in range(n):
                 q = quality[i]
                 ok = q >= self.quality_threshold
                 if ok.any():
-                    inv_cost = np.where(ok, 1.0 / np.asarray(self.model_costs, dtype=np.float32), 0.0)
+                    inv_cost = np.where(ok, 1.0 / costs, 0.0)
                     s = inv_cost.sum()
                     if s > 0:
                         y[i] = inv_cost / s
                         continue
-            name = self.mapper.mapping[c]
-            y[i, self.model_names.index(name)] = 1.0
+                best_idx = int(np.argmin(costs))
+                y[i, best_idx] = 1.0
+            return y
 
-        print(f"[BertBranch.fit] done: labels={len(labels)}, y_shape={y.shape}", flush=True)
-        return BranchResult(labels=labels, representation=Xn, soft_labels=y)
+        # objective == utility 或其他默认：按质量选最优
+        for i in range(n):
+            row = quality[i]
+            if np.all(row == row[0]):
+                y[i, :] = 1.0 / m
+                continue
+            best = int(np.argmax(row))
+            y[i, best] = 1.0
+        return y
 
     def transform_texts(self, texts: List[str], show_progress_bar: bool = False) -> np.ndarray:
         try:
