@@ -1,3 +1,43 @@
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dylib
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Coverage / testing
+.coverage
+coverage.xml
+htmlcov/
+
+# Environments
+.env
+.env.*
+.venv/
+venv/
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Project run outputs & logs
+runs/
+*.log
+*.pid
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
