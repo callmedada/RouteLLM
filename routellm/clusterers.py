@@ -1,21 +1,18 @@
 from __future__ import annotations
 
-from collections import defaultdict, Counter
-from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple, Optional
+from collections import Counter
+from collections import Counter, defaultdict
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
-from sklearn.cluster import MiniBatchKMeans
 from sklearn.feature_extraction import DictVectorizer
 
 from limbo_cluster.agglomerative import LimboAgglomerative
-
-
-@dataclass(frozen=True)
-class ClusterInfo:
-    coarse_size: int
-    unique_records: int
-    limbo_clusters: int
+from limbo_cluster.coarse import (  # type: ignore
+    CoarseToLimboClusterer as _Base,
+    ClusterInfo,
+    MiniBatchKSDivergence,
+)
 
 
 class LoggedCoarseToLimboClusterer:
@@ -38,8 +35,6 @@ class LoggedCoarseToLimboClusterer:
         random_state: int = 42,
         enable_progress_logging: bool = True,
     ) -> None:
-        from limbo_cluster.coarse import CoarseToLimboClusterer as _Base  # type: ignore
-
         self._base = _Base(
             model_names=model_names,
             model_costs=model_costs,
@@ -76,7 +71,8 @@ class LoggedCoarseToLimboClusterer:
         self.cluster_info_: Dict[int, ClusterInfo] | None = None
         self._limbo_models: Dict[int, Tuple[LimboAgglomerative, int]] = {}
         self._vectorizer: DictVectorizer | None = None
-        self._coarse_model: MiniBatchKMeans | None = None
+        self._coarse_model: MiniBatchKSDivergence | None = None
+        self.coarse_summary_: Dict[str, Any] | None = None
 
     @property
     def coarse_clusters(self) -> int:
@@ -109,15 +105,25 @@ class LoggedCoarseToLimboClusterer:
 
         vectorizer = DictVectorizer(sparse=True)
         X = vectorizer.fit_transform(records)
+        X = self._ensure_csr(X)
 
-        coarse_model = MiniBatchKMeans(
+        coarse_model = MiniBatchKSDivergence(
             n_clusters=base.coarse_clusters,
             random_state=base.random_state,
             batch_size=base.coarse_batch_size,
             max_iter=base.coarse_max_iter,
-            reassignment_ratio=0.01,
+            assign_batch_size=max(1024, base.coarse_batch_size),
         )
-        coarse_labels = coarse_model.fit_predict(X)
+        feature_names = vectorizer.get_feature_names_out()
+
+        if self.enable_progress_logging:
+            print(
+                "[CoarseToLimboClusterer.fit] starting coarse stage with MiniBatch KS divergence",
+                flush=True,
+            )
+
+        coarse_labels = coarse_model.fit_predict(X, feature_names=feature_names)
+        self.coarse_summary_ = coarse_model.summary()
 
         final_labels = np.empty(n_records, dtype=int)
         cluster_info: Dict[int, ClusterInfo] = {}
@@ -180,19 +186,28 @@ class LoggedCoarseToLimboClusterer:
         self.cluster_model_mapping_ = mapping
         self.cluster_model_probs_ = probabilities
 
-        # keep internal objects aligned for predict()
         self._vectorizer = vectorizer
         self._coarse_model = coarse_model
+
+        if self.enable_progress_logging:
+            summary = self.coarse_summary_ or {}
+            n_coarse = summary.get("n_clusters")
+            print(
+                f"[CoarseToLimboClusterer.fit] coarse summary ready (n_clusters={n_coarse})",
+                flush=True,
+            )
+
         return self
 
     def predict(self, records: Sequence[Dict[str, str]]) -> np.ndarray:
         if not records:
             raise ValueError("records cannot be empty")
-        if not hasattr(self, "_vectorizer") or not hasattr(self, "_coarse_model"):
+        if self._vectorizer is None or self._coarse_model is None:
             raise RuntimeError("You must fit the clusterer before calling predict")
 
-        X = self._vectorizer.transform(records)  # type: ignore[attr-defined]
-        coarse_preds = self._coarse_model.predict(X)  # type: ignore[attr-defined]
+        X = self._vectorizer.transform(records)
+        X = self._ensure_csr(X)
+        coarse_preds = self._coarse_model.predict(X)
         final_preds = np.empty(len(records), dtype=int)
 
         for i, coarse_id in enumerate(coarse_preds):
@@ -208,5 +223,20 @@ class LoggedCoarseToLimboClusterer:
         if self.labels_ is None:
             raise RuntimeError("Call fit before requesting cluster summary")
         return Counter(int(x) for x in self.labels_.tolist())
+
+    def coarse_summary(self, *, top_k: int = 5) -> Dict[str, Any]:
+        if self._coarse_model is None:
+            raise RuntimeError("Call fit before requesting coarse summary")
+        return self._coarse_model.summary(top_k=top_k)
+
+    @staticmethod
+    def _ensure_csr(matrix: Any) -> Any:
+        try:
+            from scipy import sparse as sp  # type: ignore
+        except Exception:  # pragma: no cover
+            return matrix
+        if sp.issparse(matrix):
+            return matrix.tocsr(copy=True)
+        return matrix
 
 

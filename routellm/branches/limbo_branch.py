@@ -295,6 +295,13 @@ class LimboBranch:
             int(cid): np.asarray(prob, dtype=np.float32).tolist() for cid, prob in probs.items()
         }
 
+        coarse_summary = getattr(self.clusterer, "coarse_summary_", None)
+        if coarse_summary is None and hasattr(self.clusterer, "coarse_summary"):
+            try:
+                coarse_summary = self.clusterer.coarse_summary()
+            except Exception:
+                coarse_summary = None
+
         overall = {
             "labels": labels.tolist(),
             "cluster_counts": {int(k): int(v) for k, v in Counter(labels.tolist()).items()},
@@ -302,6 +309,7 @@ class LimboBranch:
             "cluster_model_probs": cluster_model_probs,
             "summary": self.summary(top_k=None),
             "profiles": self.cluster_profiles(),
+            "coarse_summary": coarse_summary,
         }
         if coarse_labels is not None:
             overall["coarse_labels"] = np.asarray(coarse_labels, dtype=np.int32).tolist()
