@@ -22,7 +22,7 @@ def train_and_eval(
     print(f"[train_and_eval] items={len(items)}, val_ratio={val_ratio}", flush=True)
     train_items, val_items = split_dataset(items, val_ratio=val_ratio)
     tr_texts, tr_feats, tr_labels, tr_q = extract_xy(train_items)
-    vl_texts, vl_feats, vl_labels, _, vl_costs = extract_xy_with_costs(val_items)
+    vl_texts, vl_feats, vl_labels, vl_qualities, vl_costs = extract_xy_with_costs(val_items)
     print(f"[train_and_eval] split: train={len(tr_texts)}, val={len(vl_texts)}", flush=True)
     quality = None
     if tr_q is not None:
@@ -33,7 +33,7 @@ def train_and_eval(
     print("[train_and_eval] fitting pipeline", flush=True)
     pipeline.fit(tr_texts, tr_feats, quality=quality)
     print("[train_and_eval] evaluating pipeline", flush=True)
-    metrics = pipeline.evaluate(vl_texts, vl_feats, vl_labels, sample_costs=vl_costs)
+    metrics = pipeline.evaluate(vl_texts, vl_feats, vl_labels, quality=vl_qualities, sample_costs=vl_costs)
     # 记录日志
     logger = RunLogger()
     run = logger.create()
@@ -55,6 +55,7 @@ def train_and_eval(
             fallback_strategy=config.fallback_strategy,
             fallback_model_name=config.fallback_model_name,
             per_sample_costs=vl_costs,
+            quality=vl_qualities,
         )
         # 在 evaluation.json 中追加 config 字段
         try:

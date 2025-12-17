@@ -333,7 +333,7 @@ class RouterPipeline:
         return self.model_names[idx], float(probs[idx]), idx
 
     # evaluate
-    def evaluate(self, texts: List[str], features: List[Dict[str, str]], labels: Optional[List[int]] = None, sample_costs: Optional[List[List[float]]] = None) -> Dict[str, float]:
+    def evaluate(self, texts: List[str], features: List[Dict[str, str]], labels: Optional[List[int]] = None, quality: Optional[List[List[float]]] = None, sample_costs: Optional[List[List[float]]] = None) -> Dict[str, float]:
         try:
             print(f"[RouterPipeline.evaluate] start: n={len(texts)}", flush=True)
         except Exception:
@@ -341,6 +341,7 @@ class RouterPipeline:
         hits = 0
         costs: List[float] = []
         preds: List[int] = []
+        probs_list: List[np.ndarray] = []
         route_hist = {name: 0 for name in self.model_names}
 
         auto_feats = self._extract_query_features(texts)
@@ -374,6 +375,7 @@ class RouterPipeline:
             for i in iterator:
                 logp = self.fuser_torch(torch.from_numpy(xn[i:i+1].astype(np.float32)))  # type: ignore[arg-type]
                 probs = logp.exp().numpy()[0]
+                probs_list.append(probs)
                 idx = int(np.argmax(probs))
                 preds.append(idx)
                 if sample_costs is not None and i < len(sample_costs):
@@ -387,18 +389,83 @@ class RouterPipeline:
                 route_hist[self.model_names[idx]] += 1
                 if labels is not None and i < len(labels):
                     hits += int(idx == labels[i])
+        
         metrics: Dict[str, float] = {"avg_cost": float(np.mean(costs))}
         total = max(1, len(texts))
         for name, cnt in route_hist.items():
             metrics[f"route_{name}"] = cnt / total
 
-        # 若提供标签，计算扩展指标用于“在保持性能的前提下最小化成本”的可行性分析
+        # Quality Metrics
+        if quality is not None and len(quality) == len(preds):
+            q_arr = np.asarray(quality, dtype=np.float32)
+            # Avg Quality
+            pred_q = q_arr[np.arange(len(preds)), preds]
+            avg_q = float(pred_q.mean())
+            metrics["avg_quality"] = avg_q
+            
+            # Oracle Quality
+            oracle_q = q_arr.max(axis=1).mean()
+            metrics["oracle_quality"] = float(oracle_q)
+            
+            # Regret & Retention
+            metrics["quality_regret"] = float(oracle_q - avg_q)
+            metrics["quality_retention"] = float(avg_q / oracle_q) if oracle_q > 1e-9 else 1.0
+
+        # Cost Metrics
+        if self.model_costs:
+            max_cost = max(self.model_costs)
+            metrics["cost_savings"] = float((max_cost - metrics["avg_cost"]) / max_cost) if max_cost > 1e-9 else 0.0
+
+        # Classification Metrics (requires labels)
         if labels is not None and len(labels) == len(preds) and len(labels) > 0:
             labels_np = np.asarray(labels, dtype=np.int64)
             preds_np = np.asarray(preds, dtype=np.int64)
+            
+            # Top-1 Accuracy
             top1_acc = float((preds_np == labels_np).mean())
             metrics["top1_acc"] = top1_acc
+            
+            # Cost per Correct
+            metrics["cost_per_correct"] = metrics["avg_cost"] / max(1e-9, top1_acc)
 
+            # Top-k Accuracy
+            if probs_list:
+                probs_np = np.asarray(probs_list)
+                for k in [3, 5]:
+                    if k <= len(self.model_names):
+                        top_k_idx = np.argsort(probs_np, axis=1)[:, -k:]
+                        top_k_hits = np.any(top_k_idx == labels_np[:, None], axis=1).mean()
+                        metrics[f"top{k}_acc"] = float(top_k_hits)
+            
+            # Advanced Classification: F1 & MCC
+            # Simple numpy implementation to avoid heavy sklearn dependency if not needed, 
+            # but for MCC/F1 sklearn is robust.
+            try:
+                from sklearn.metrics import f1_score, matthews_corrcoef # type: ignore
+                metrics["macro_f1"] = float(f1_score(labels_np, preds_np, average="macro"))
+                metrics["weighted_f1"] = float(f1_score(labels_np, preds_np, average="weighted"))
+                metrics["mcc"] = float(matthews_corrcoef(labels_np, preds_np))
+            except ImportError:
+                pass
+            except Exception:
+                pass
+
+            # Distribution Metrics: KL Divergence
+            # P: predicted distribution (histogram), Q: label distribution (histogram)
+            # Add smoothing to avoid log(0)
+            n_classes = len(self.model_names)
+            p_hist = np.bincount(preds_np, minlength=n_classes).astype(np.float32) / total
+            q_hist = np.bincount(labels_np, minlength=n_classes).astype(np.float32) / total
+            epsilon = 1e-9
+            p_hist = np.clip(p_hist, epsilon, 1.0)
+            q_hist = np.clip(q_hist, epsilon, 1.0)
+            # Normalize again
+            p_hist /= p_hist.sum()
+            q_hist /= q_hist.sum()
+            kl = np.sum(p_hist * np.log(p_hist / q_hist))
+            metrics["kl_div"] = float(kl)
+
+            # --- Existing Baselines Logic ---
             # 固定路由至每个模型的基线：准确率与单位成本
             fixed_accs: List[float] = []
             for model_idx in range(len(self.model_names)):

@@ -155,6 +155,7 @@ def generate_evaluation_report(
     fallback_strategy: str = "best_fixed",
     fallback_model_name: Optional[str] = None,
     per_sample_costs: Optional[List[List[float]]] = None,
+    quality: Optional[List[List[float]]] = None,
 ) -> Dict[str, object]:
     os.makedirs(save_dir, exist_ok=True)
 
@@ -207,6 +208,63 @@ def generate_evaluation_report(
         avg_cost = float(costs_arr[preds_np].mean()) if len(preds_np) else 0.0
     top1_acc = float((preds_np == labels_np).mean()) if len(labels_np) else 0.0
     cost_per_correct = avg_cost / max(1e-12, top1_acc)
+
+    # Extended Metrics
+    ext_metrics: Dict[str, float] = {}
+    
+    # Quality Metrics
+    if quality is not None and len(quality) == len(preds_np):
+        q_arr = np.asarray(quality, dtype=np.float32)
+        # Filter to labeled subset if needed, assuming quality aligns with texts/preds
+        # Note: preds_np is filtered by mask (labeled only). 
+        # quality input corresponds to all texts.
+        # So we need to filter quality by mask.
+        if len(quality) == len(texts):
+            q_arr = q_arr[mask]
+        
+        if len(q_arr) == len(preds_np):
+            pred_q = q_arr[np.arange(len(preds_np)), preds_np]
+            avg_q = float(pred_q.mean())
+            oracle_q = float(q_arr.max(axis=1).mean())
+            ext_metrics["avg_quality"] = avg_q
+            ext_metrics["oracle_quality"] = oracle_q
+            ext_metrics["quality_regret"] = oracle_q - avg_q
+            ext_metrics["quality_retention"] = avg_q / oracle_q if oracle_q > 1e-9 else 1.0
+
+    # Cost Savings
+    max_cost = float(np.max(costs_arr)) if len(costs_arr) > 0 else 0.0
+    ext_metrics["cost_savings"] = (max_cost - avg_cost) / max_cost if max_cost > 1e-9 else 0.0
+
+    # Advanced Classification
+    if len(labels_np) > 0:
+        # Top-k
+        for k in [3, 5]:
+            if k <= len(model_names):
+                top_k_idx = np.argsort(probs_np, axis=1)[:, -k:]
+                top_k_hits = np.any(top_k_idx == labels_np[:, None], axis=1).mean()
+                ext_metrics[f"top{k}_acc"] = float(top_k_hits)
+        
+        # F1 & MCC
+        try:
+            from sklearn.metrics import f1_score, matthews_corrcoef # type: ignore
+            ext_metrics["macro_f1"] = float(f1_score(labels_np, preds_np, average="macro"))
+            ext_metrics["weighted_f1"] = float(f1_score(labels_np, preds_np, average="weighted"))
+            ext_metrics["mcc"] = float(matthews_corrcoef(labels_np, preds_np))
+        except (ImportError, Exception):
+            pass
+
+        # KL Divergence
+        n_classes = len(model_names)
+        total_labeled = len(labels_np)
+        p_hist = np.bincount(preds_np, minlength=n_classes).astype(np.float32) / max(1, total_labeled)
+        q_hist = np.bincount(labels_np, minlength=n_classes).astype(np.float32) / max(1, total_labeled)
+        epsilon = 1e-9
+        p_hist = np.clip(p_hist, epsilon, 1.0)
+        q_hist = np.clip(q_hist, epsilon, 1.0)
+        p_hist /= p_hist.sum()
+        q_hist /= q_hist.sum()
+        kl = np.sum(p_hist * np.log(p_hist / q_hist))
+        ext_metrics["kl_div"] = float(kl)
 
     # per-model metrics & confusion matrix
     cm, per_model_prf = _calc_confusion_and_prf(labels_np, preds_np, num_classes=len(model_names))
@@ -302,6 +360,7 @@ def generate_evaluation_report(
             "avg_cost": avg_cost,
             "top1_acc": top1_acc,
             "cost_per_correct": cost_per_correct,
+            **ext_metrics,
         },
         "route_ratio": {f"route_{k}": v for k, v in route_hist.items()},
         "per_model": {
@@ -340,9 +399,36 @@ def generate_evaluation_report(
     md_path = os.path.join(save_dir, "evaluation.md")
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("# Evaluation Report\n\n")
-        f.write(f"- avg_cost: {avg_cost}\n")
-        f.write(f"- top1_acc: {top1_acc}\n")
-        f.write(f"- cost_per_correct: {cost_per_correct}\n\n")
+        f.write("## Overall Metrics\n\n")
+        f.write(f"- avg_cost: {avg_cost:.6f}\n")
+        f.write(f"- top1_acc: {top1_acc:.4f}\n")
+        f.write(f"- cost_per_correct: {cost_per_correct:.6f}\n")
+        if "cost_savings" in ext_metrics:
+            f.write(f"- cost_savings: {ext_metrics['cost_savings']:.2%}\n")
+        
+        if "avg_quality" in ext_metrics:
+            f.write("\n### Quality Analysis\n")
+            f.write(f"- avg_quality: {ext_metrics['avg_quality']:.4f}\n")
+            f.write(f"- oracle_quality: {ext_metrics['oracle_quality']:.4f}\n")
+            f.write(f"- quality_regret: {ext_metrics['quality_regret']:.4f}\n")
+            f.write(f"- quality_retention: {ext_metrics['quality_retention']:.2%}\n")
+        
+        if "macro_f1" in ext_metrics or "top3_acc" in ext_metrics:
+            f.write("\n### Advanced Classification\n")
+            if "top3_acc" in ext_metrics:
+                f.write(f"- top3_acc: {ext_metrics['top3_acc']:.4f}\n")
+            if "top5_acc" in ext_metrics:
+                f.write(f"- top5_acc: {ext_metrics['top5_acc']:.4f}\n")
+            if "macro_f1" in ext_metrics:
+                f.write(f"- macro_f1: {ext_metrics['macro_f1']:.4f}\n")
+            if "weighted_f1" in ext_metrics:
+                f.write(f"- weighted_f1: {ext_metrics['weighted_f1']:.4f}\n")
+            if "mcc" in ext_metrics:
+                f.write(f"- mcc: {ext_metrics['mcc']:.4f}\n")
+            if "kl_div" in ext_metrics:
+                f.write(f"- kl_div: {ext_metrics['kl_div']:.4f}\n")
+        f.write("\n")
+
         # 记录关键超参数（含融合与LIMBO）
         cfg = getattr(pipeline, "config", None)
         if cfg is not None:
